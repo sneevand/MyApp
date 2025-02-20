@@ -1,0 +1,290 @@
+# qa_system.py
+from transformers import pipeline
+import logging
+
+class QuestionAnswering:
+    def __init__(self, vector_db):
+        """
+        Initializes the QA system with the vector database and LLM.
+        """
+        self.vector_db = vector_db
+        try:
+            self.llm = pipeline("text-generation", model="tiiuae/falcon-7b-instruct", device_map="auto")
+            logging.info("Successfully loaded the LLM model")
+        except Exception as e:
+            logging.error(f"Error loading LLM: {e}")
+            raise
+
+    def answer(self, question):
+        """
+        Retrieves relevant context and generates an answer using LLM.
+        """
+        try:
+            relevant_context = self.vector_db.retrieve(question, top_k=5)
+            if not relevant_context:
+                logging.warning(f"No relevant context found for question: {question}")
+                return "No relevant information found."
+
+            context_text = " ".join(relevant_context)
+            logging.info(f"Retrieved {len(relevant_context)} context segments for question")
+            
+            prompt = (
+                f"Context: {context_text}\n\n"
+                f"Question: {question}\n"
+                "Answer: "
+            )
+
+            response = self.llm(prompt, max_length=300, do_sample=True, temperature=0.3)
+            
+            # Extract only the answer portion
+            generated_text = response[0]["generated_text"]
+            answer = generated_text.split("Answer: ")[-1].strip()
+            
+            # If the answer is still empty or too short, try to extract it differently
+            if len(answer) < 10:
+                answer = generated_text.split(f"Question: {question}")[-1].strip()
+            
+            logging.info(f"Generated answer of length {len(answer)}")
+            return answer
+            
+        except Exception as e:
+            logging.error(f"Error generating answer: {e}")
+            return f"Error generating answer: {str(e)}"
+
+
+
+# vector_db.py
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import logging
+import re
+
+class VectorDatabase:
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        """
+        Initializes the vector database and embedding model.
+        """
+        logging.info(f"Initializing SentenceTransformer with model: {model_name}")
+        self.model = SentenceTransformer(model_name)
+        self.index = None
+        self.text_data = []
+
+    def store(self, content):
+        """
+        Converts text into embeddings and stores them in FAISS.
+        """
+        # Improved text chunking - split by sentences and ensure chunks aren't too small
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < 1000:
+                current_chunk += " " + sentence if current_chunk else sentence
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        self.text_data = chunks
+        logging.info(f"Created {len(chunks)} text chunks for embedding")
+        
+        try:
+            logging.info("Generating embeddings...")
+            embeddings = self.model.encode(self.text_data, convert_to_numpy=True, show_progress_bar=True)
+            
+            # Normalize embeddings for cosine similarity
+            faiss.normalize_L2(embeddings)
+            
+            # Initialize FAISS index - use IndexFlatIP for cosine similarity
+            dimension = embeddings.shape[1]
+            self.index = faiss.IndexFlatIP(dimension)
+            self.index.add(embeddings)
+            
+            logging.info(f"Successfully stored {len(self.text_data)} chunks in FAISS index")
+        except Exception as e:
+            logging.error(f"Error in embedding generation or indexing: {e}")
+            raise
+
+    def retrieve(self, query, top_k=5):
+        """
+        Retrieves the most relevant text chunks for a given query.
+        """
+        if not self.index:
+            raise ValueError("Vector database is empty. Please store embeddings first.")
+        
+        try:
+            logging.info(f"Retrieving top {top_k} chunks for query: {query}")
+            query_embedding = self.model.encode([query], convert_to_numpy=True)
+            faiss.normalize_L2(query_embedding)
+            
+            distances, indices = self.index.search(query_embedding, top_k)
+            
+            # Debug search results
+            logging.info(f"Search results - distances: {distances[0]}")
+            
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(self.text_data):
+                    results.append(self.text_data[idx])
+                    logging.debug(f"Retrieved chunk {idx} with score {distances[0][i]}")
+                
+            return results
+        except Exception as e:
+            logging.error(f"Error during retrieval: {e}")
+            raise
+
+
+
+
+# data_ingestion.py
+import requests
+from bs4 import BeautifulSoup
+import logging
+import time
+
+def fetch_and_preprocess_content(url):
+    """
+    Fetches content from Deloitte's webpage and preprocesses the text.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    
+    # Add retry mechanism
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Fetching content from {url}, attempt {attempt+1}/{max_retries}")
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff
+                logging.warning(f"Request failed: {e}. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"Failed to fetch webpage after {max_retries} attempts: {e}")
+                raise
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    
+    # Improved content extraction - target main content area
+    main_content = soup.find("div", class_="rie-main-content") or soup.find("article") or soup
+    
+    # Extract all relevant text elements
+    text_elements = []
+    for element in main_content.find_all(["p", "h1", "h2", "h3", "h4", "h5", "li"]):
+        text = element.get_text().strip()
+        if text and len(text) > 20:  # Skip very short elements
+            text_elements.append(text)
+    
+    if not text_elements:
+        # Fallback to all paragraphs if main content not found
+        text_elements = [p.get_text().strip() for p in soup.find_all("p") if p.get_text().strip()]
+    
+    content = " ".join(text_elements)
+    
+    # Enhanced cleaning
+    content = content.replace("\n", " ").replace("\t", " ")
+    content = ' '.join(content.split())  # Remove extra spaces
+    
+    if not content:
+        raise ValueError("No content extracted from the page.")
+
+    word_count = len(content.split())
+    logging.info(f"Successfully extracted {word_count} words from Deloitte's update.")
+    
+    if word_count < 100:
+        logging.warning("Extracted content seems unusually short. Check parsing logic.")
+    
+    return content
+
+
+# main.py
+import os
+import logging
+import sys
+from data_ingestion import fetch_and_preprocess_content
+from vector_db import VectorDatabase
+from qa_system import QuestionAnswering
+
+# Configurations
+URL = "https://www2.deloitte.com/us/en/insights/economy-update/weekly-update-2023-10.html?icid=archive_click"
+QUESTION_FILE = "questions.txt"
+OUTPUT_FILE = "responses.txt"
+
+# Enhanced logging setup
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(
+    level=logging.INFO,
+    format=log_format,
+    handlers=[
+        logging.FileHandler("qa_system.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+def main():
+    logging.info("=" * 50)
+    logging.info("Starting Economic Update QA System...")
+    
+    try:
+        # Step 1: Fetch and clean data
+        logging.info("Fetching and processing Deloitte economic update content...")
+        content = fetch_and_preprocess_content(URL)
+        logging.info(f"Content sample: {content[:200]}...")
+        
+        # Step 2: Store embeddings in FAISS
+        logging.info("Initializing vector database and storing embeddings...")
+        vectordb = VectorDatabase()
+        vectordb.store(content)
+        
+        # Step 3: Initialize QA system
+        logging.info("Initializing Question Answering system...")
+        qa_system = QuestionAnswering(vectordb)
+        
+        # Step 4: Read user queries
+        if not os.path.exists(QUESTION_FILE):
+            logging.error(f"Error: {QUESTION_FILE} not found.")
+            return
+        
+        with open(QUESTION_FILE, "r", encoding="utf-8") as file:
+            questions = [line.strip() for line in file.readlines() if line.strip()]
+        
+        if not questions:
+            logging.error(f"No questions found in {QUESTION_FILE}")
+            return
+            
+        logging.info(f"Processing {len(questions)} questions...")
+        
+        # Step 5: Generate responses
+        responses = []
+        for i, question in enumerate(questions):
+            logging.info(f"Processing question {i+1}/{len(questions)}: {question}")
+            response = qa_system.answer(question)
+            responses.append(response)
+            logging.info(f"Generated response: {response[:100]}...")
+        
+        # Step 6: Save responses
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+            for i, (question, response) in enumerate(zip(questions, responses)):
+                file.write(f"Question {i+1}: {question}\n")
+                file.write(f"Answer: {response}\n\n")
+        
+        logging.info(f"Responses saved to {OUTPUT_FILE}")
+        
+    except Exception as e:
+        logging.error(f"Application failed: {e}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
