@@ -463,4 +463,86 @@ class QuestionAnswering:
             logging.error(f"Error generating answer: {e}")
             return f"Error generating answer: {str(e)}"
 
+import logging
+import torch
+import time
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+
+class QuestionAnswering:
+    def __init__(self, vector_db):
+        """
+        Initializes the QA system with an optimized LLM and vector database.
+        """
+        self.vector_db = vector_db
+        try:
+            model_name = "tiiuae/falcon-7b-instruct"
+
+            # Load tokenizer with truncation enabled for better efficiency
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token or "</s>"
+
+            # Load model with Accelerate handling device placement automatically
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,  # Use float16 for efficient memory usage
+                device_map="auto"  # Let Accelerate manage the device placement
+            )
+
+            # Optimized text generation pipeline
+            self.llm = pipeline(
+                "text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+
+            logging.info("LLM successfully loaded with Accelerate handling device placement")
+
+        except Exception as e:
+            logging.error(f"Error loading LLM: {e}")
+            raise
+
+    def answer(self, question):
+        """
+        Retrieves relevant context and generates an optimized answer using LLM.
+        """
+        try:
+            start_time = time.time()
+
+            # Retrieve relevant context with FAISS (parallelized for speed)
+            relevant_context = self.vector_db.retrieve(question, top_k=5)
+            if not relevant_context:
+                logging.warning(f"No relevant context found for: {question}")
+                return "No relevant information found."
+
+            context_text = " ".join(relevant_context)
+            logging.info(f"Retrieved {len(relevant_context)} segments in {time.time() - start_time:.2f}s")
+
+            # Construct optimized prompt
+            prompt = f"Context:\n{context_text}\n\nQuestion: {question}\nAnswer:"
+
+            # Generate answer with efficiency settings
+            response = self.llm(
+                prompt,
+                max_new_tokens=80,  # Faster response time
+                temperature=0.3,  # More deterministic but not too rigid
+                do_sample=False,  # Ensures consistency
+                top_p=0.9,  # Prevents low-quality completions
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+
+            # Extract and clean generated text
+            generated_text = response[0]["generated_text"].strip()
+            answer = generated_text.split("Answer:")[-1].strip() if "Answer:" in generated_text else generated_text
+
+            end_time = time.time()
+            logging.info(f"Generated answer in {end_time - start_time:.2f}s: {answer[:100]}...")
+
+            return answer
+
+        except Exception as e:
+            logging.error(f"Error generating answer: {e}")
+            return f"Error generating answer: {str(e)}"
 
