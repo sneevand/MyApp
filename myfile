@@ -288,3 +288,89 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+
+from transformers import pipeline, AutoTokenizer
+import logging
+
+class QuestionAnswering:
+    def __init__(self, vector_db):
+        """
+        Initializes the QA system with the vector database and LLM.
+        """
+        self.vector_db = vector_db
+        try:
+            model_name = "tiiuae/falcon-7b-instruct"
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+            # Explicitly define eos_token if missing
+            if not self.tokenizer.eos_token:
+                self.tokenizer.eos_token = "</s>"  # Common EOS token substitute
+
+            # Explicitly define pad_token if missing
+            if not self.tokenizer.pad_token:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            self.llm = pipeline(
+                "text-generation",
+                model=model_name,
+                tokenizer=self.tokenizer,  # Pass tokenizer explicitly
+                device_map="auto",
+                pad_token_id=self.tokenizer.pad_token_id  # Ensures proper padding
+            )
+            
+            logging.info("Successfully loaded the LLM model")
+
+        except Exception as e:
+            logging.error(f"Error loading LLM: {e}")
+            raise
+
+    def answer(self, question):
+        """
+        Retrieves relevant context and generates an answer using LLM.
+        """
+        try:
+            relevant_context = self.vector_db.retrieve(question, top_k=5)
+            if not relevant_context:
+                logging.warning(f"No relevant context found for question: {question}")
+                return "No relevant information found."
+
+            context_text = " ".join(relevant_context)
+            logging.info(f"Retrieved {len(relevant_context)} context segments for question")
+
+            # Construct prompt
+            prompt = (
+                f"Context: {context_text}\n\n"
+                f"Question: {question}\n"
+                "Answer: "
+            )
+
+            # Generate answer
+            response = self.llm(
+                prompt,
+                max_new_tokens=200,  # Controls the generated output length
+                temperature=0.3,
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id  # Ensures proper padding
+            )
+
+            # Extract only the generated text
+            generated_text = response[0]["generated_text"].strip()
+
+            # Extract the answer portion
+            if "Answer:" in generated_text:
+                answer = generated_text.split("Answer:")[-1].strip()
+            else:
+                answer = generated_text  # Fallback if expected format isn't found
+
+            # Ensure meaningful response
+            if len(answer) < 10:
+                logging.warning("Generated answer is too short, may need refinement.")
+
+            logging.info(f"Generated answer of length {len(answer)}")
+            return answer
+
+        except Exception as e:
+            logging.error(f"Error generating answer: {e}")
+            return f"Error generating answer: {str(e)}"
+
